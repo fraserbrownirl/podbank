@@ -36,9 +36,10 @@ Do not follow dphn.ai “we recommend Lium.”
 `https://v2.dphn.ai/api/worker/bootstrap/<uuid>?owner=…&exp=…&sig=…`
 
 - You CANNOT mint it. It needs a wallet SIWE session; the `dp-` key returns `401` on the mint API.
-- Human clicks Worker Link, pastes the URL, you rent **immediately**.
-- Reusing a spent/expired link fails.
-- Bake into on-start: `./dolphinpod-worker bootstrap "<url>"`.
+- Human clicks Worker Link, **pastes the URL in this chat**, you rent **immediately** on a **new** box. First boot is the only time on-start runs.
+- The Worker Link is **not** `$DOLPHINPOD_API_KEY` and **not** an env you poll later. If the human puts the URL in env, do **not** rent first and `PUT` on-start afterwards. On-start on a live contract does not re-run. That box will never enroll.
+- Reusing a spent/expired link fails. Do not patch on-start on an already-`running` instance.
+- Bake into on-start **in the rent `PUT /asks/` body**: `./dolphinpod-worker bootstrap "<url>"`.
 
 **B — durable worker.json (only if no fresh link AND `$DOLPHINPOD_API_KEY` is set).**
 `dp-` authenticates the binary on the GPU. It does **not** mint a Worker Link. Bake this into
@@ -62,6 +63,7 @@ Prefer A when a link is pasted so a long-lived `dp-` is not stored in Vast `onst
 - Rent an SM<8.9 GPU for this model (see Hardware). Ignore dphn.ai lists that still name A100 / 3090.
 - Run the worker binary or `bootstrap` inside your sandbox — it runs on the box via on-start.
 - Call Vast `execute` with `./dolphinpod-worker stop` (or tail/ps/nvidia-smi). Whitelist is `ls` / `rm` / `du` only; anything else is 400 `Invalid command given.`
+- Read a Worker Link from env and attach it to an instance that already has `start_date`. Rent and bootstrap are one `PUT /asks/`.
 
 ## HOW TO CHOOSE A BOX  ← this is where every wheel-spin happened; get it right
 **Rank on Vast's own reliability signals, NOT price.** The cheap ~$0.97 hosts are junk; a reliable box
