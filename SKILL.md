@@ -16,11 +16,17 @@ visibility: private
 - Binary: `https://updates.dphn.ai/dolphinpod-worker-v2_linux_amd64` (v2 / vllm 0.23.0).
 
 ## Your sandbox = HTTP only
-You have `$VAST_API_KEY`, optional `$DOLPHINPOD_API_KEY`, `call_http_endpoint`, `browse_url`.
+You have `$VAST_API_KEY`, optional `$DOLPHINPOD_API_KEY`, `$OPS_SSH_PUBKEY`, `call_http_endpoint`, `browse_url`.
 **No ssh, no python, no jq, no package manager.**
 You cannot SSH in to run bootstrap, `nvidia-smi`, or `nohup`. Bake the entire deploy into the Vast
 **on-start** script. The box self-enrolls at boot. Ready = v2.dphn.ai **Active Nodes** 0→1.
 `runtype: ssh` is Vast’s launch mode (ports). You still do not SSH.
+
+**At setup, read `$OPS_SSH_PUBKEY` from env and inject it into the on-start** (substitute it for
+`__OPS_PUBKEY__`; see §On-start self-boot). You can't SSH, but the human operator can — this is how
+they read `/workspace/selfboot.log`, run `status`/`logs`, or `start --debug` when a node misbehaves.
+`$OPS_SSH_PUBKEY` is a **public** key (safe to place in on-start); never inject a private key.
+If it's unset, omit the SSH block and proceed.
 
 ## Marketplace — Vast only
 Rent **only** on Vast.ai. Prepaid credit on cloud.vast.ai/billing.
@@ -38,8 +44,8 @@ Do not follow dphn.ai “we recommend Lium.”
 - You CANNOT mint it. It needs a wallet SIWE session; the `dp-` key returns `401` on the mint API.
 - Human clicks Worker Link, **pastes the URL in this chat**, you rent **immediately** on a **new** box. First boot is the only time on-start runs.
 - The Worker Link is **not** `$DOLPHINPOD_API_KEY` and **not** an env you poll later. If the human puts the URL in env, do **not** rent first and `PUT` on-start afterwards. On-start on a live contract does not re-run. That box will never enroll.
-- Reusing a spent/expired link fails. Do not patch on-start on an already-`running` instance.
-- Bake into on-start **in the rent `PUT /asks/` body**: `./dolphinpod-worker bootstrap "<url>"`.
+- The link is **single-use AND time-limited**: the first successful `bootstrap` consumes it (worker then runs on stored credentials); the signed URL also expires (`exp`, ~24-40 min). Reusing a spent/expired link fails. Mint FRESH, use ONCE, immediately. Do not patch on-start on an already-`running` instance.
+- Bake into on-start **in the rent `PUT /asks/` body**, called **exactly once** (see §On-start self-boot — NEVER loop `bootstrap`, it self-supervises): `./dolphinpod-worker bootstrap "<url>" background`.
 
 **B — durable worker.json (only if no fresh link AND `$DOLPHINPOD_API_KEY` is set).**
 `dp-` authenticates the binary on the GPU. It does **not** mint a Worker Link. Bake this into
@@ -169,16 +175,38 @@ PUT https://console.vast.ai/api/v0/instances/<id>/
 
 Never destroy a non-`dolphinpod` label.
 
-## On-start self-boot (`__LINK__` = the fresh Worker Link)
+## On-start self-boot (`__LINK__` = the fresh Worker Link, `__OPS_PUBKEY__` = operator SSH pubkey)
 Runs as root at boot. `HF_*` is the crash-loop fix (worker otherwise offline-resolves the cache
 at the wrong path). Egress guard aborts on a firewalled host instead of half-enrolling.
 
 **Do not `set -e`.** Bootstrap exiting during the 24 GB pull is normal; `set -e` kills on-start and the node never goes Active.
 **Do not `sudo`.** Vast images are already root; `sudo` can hang on a tty/password and the worker never starts.
-Loop bootstrap so a crash-loop recovers:
+**Call `bootstrap` EXACTLY ONCE — NEVER in a loop.** `bootstrap` enrolls the worker and starts a
+self-supervising background process (`dolphinpod-worker supervise`) that restarts the inference
+backend on its own. A `while true; bootstrap; sleep 8` loop is FATAL for two compounding reasons —
+this was the root cause of every "running but never Active" box:
+1. **The Worker Link is single-use.** The first `bootstrap` consumes it; every later loop iteration
+   re-runs a **spent** link. (See §#1 rule.)
+2. **Each new `bootstrap` kills the running worker.** The supervisor is a grandchild of the loop, so
+   it gets `SIGTERM` every ~8 s and never survives long enough to download the model — GPU stays cold
+   (idle temp, 0 % util), the HF cache stays empty, `worker.log` freezes at `selected GPUs`, and the
+   node never goes Active. (The real backend errors go to a UDS log, not `worker.log`; `start --debug`
+   in the foreground is the only way to see them — hence SSH below.)
+
+**SSH-inject for debugging (recommended).** Vast does NOT reliably inject account SSH keys into the
+container, so without this you cannot SSH in to read `/workspace/selfboot.log`, run `status`/`logs`,
+or `start --debug` to see the real backend error. Inject the operator's OWN pubkey, substituted at
+rent time from a secret (`$OPS_SSH_PUBKEY` → `__OPS_PUBKEY__`) — NEVER a hardcoded personal key and
+NEVER a private key: whoever holds the matching private key gets root on every node this skill spins
+up. If `$OPS_SSH_PUBKEY` is unset, drop the SSH block entirely. (Repo is private, so a single
+eng-owned ops pubkey inline is also acceptable — still never a private key.)
 
 ```bash
 #!/bin/bash
+# SSH-inject (omit this block if no operator pubkey). __OPS_PUBKEY__ = a PUBLIC key only.
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+echo "__OPS_PUBKEY__" >> /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
 mkdir -p /workspace && cd /workspace
 export HF_HOME=/root/.cache/dolphinpod-worker/cache
 export HF_HUB_CACHE=/root/.cache/dolphinpod-worker/cache/hub
@@ -190,23 +218,29 @@ case "$code" in
   200|301|302|307|308) ;;
   *) echo "EGRESS FAIL http=$code" > /workspace/selfboot.log; exit 0 ;;
 esac
-while true; do
-  echo "$(date -u +%FT%TZ) bootstrap start" >> /workspace/selfboot.log
-  ./dolphinpod-worker bootstrap "__LINK__" >> /workspace/selfboot.log 2>&1
-  echo "$(date -u +%FT%TZ) bootstrap exited $?" >> /workspace/selfboot.log
-  sleep 8
-done
+# bootstrap ONCE — it self-supervises and restarts the backend on its own. Do NOT loop it.
+echo "$(date -u +%FT%TZ) bootstrap start" >> /workspace/selfboot.log
+./dolphinpod-worker bootstrap "__LINK__" background >> /workspace/selfboot.log 2>&1
+echo "$(date -u +%FT%TZ) bootstrap exited $?" >> /workspace/selfboot.log
 ```
-Rent body: `{"client_id":"me","image":"vastai/base-image:cuda-13.0.1-auto","disk":160,"runtype":"ssh","label":"dolphinpod","onstart":"<script above with __LINK__ replaced>"}`
+Rent body: `{"client_id":"me","image":"vastai/base-image:cuda-13.0.1-auto","disk":160,"runtype":"ssh","label":"dolphinpod","onstart":"<script above with __LINK__ and __OPS_PUBKEY__ replaced>"}`
+
+**Verify/debug over SSH** (once the box is `running` and `__OPS_PUBKEY__` was injected):
+`ssh -i <your_key> -p <ssh_port> root@<ssh_host>` then on the box:
+`cd /workspace && ./dolphinpod-worker status` · `du -sh /root/.cache/dolphinpod-worker/cache`
+(should grow toward ~15-24 GB) · `pgrep -af aphrodite` (backend up) ·
+`nvidia-smi` (util/temp rise when the model loads) · for the real error, stop then
+`./dolphinpod-worker stop && ./dolphinpod-worker start --debug` in the foreground.
 
 ## Go-live sequence
 1. Human mints a FRESH Worker Link (wallet), or you use path B if `$DOLPHINPOD_API_KEY` is set and no link.
-2. `GET /users/current/` — confirm credit.
-3. `GET /api/v1/instances` — if a `label=dolphinpod` instance exists, `DELETE` it. Leave every other label.
-4. Choose a box. `PUT /asks/<id>/` with the on-start. Save `new_contract`.
-5. Poll until `actual_status = running` (image pull). Then wait — the ~24 GB model pull continues on-box.
-6. Success = dashboard v2.dphn.ai **Active Nodes 0→1**. You cannot read the box log via execute. Confirm on the dashboard (or `request_logs` → `result_url`).
-7. Stop worker / teardown = `DELETE /instances/<that dolphinpod id>/`. Do not `execute` `./dolphinpod-worker stop`.
+2. **Read `$OPS_SSH_PUBKEY` from env** and substitute it into the on-start `__OPS_PUBKEY__` (so the operator can SSH in for logs/debug later). If unset, drop the SSH block.
+3. `GET /users/current/` — confirm credit.
+4. `GET /api/v1/instances` — if a `label=dolphinpod` instance exists, `DELETE` it. Leave every other label.
+5. Choose a box. `PUT /asks/<id>/` with the on-start (`__LINK__` + `__OPS_PUBKEY__` substituted, `bootstrap` called ONCE — never looped). Save `new_contract`.
+6. Poll until `actual_status = running` (image pull). Then wait — the ~24 GB model pull continues on-box (20–40 min), then flashinfer JIT-compiles Blackwell kernels before the node registers.
+7. Success = dashboard v2.dphn.ai **Active Nodes 0→1**. You cannot read the box log via execute. Confirm on the dashboard (or `request_logs` → `result_url`, or have the operator SSH in with their key).
+8. Stop worker / teardown = `DELETE /instances/<that dolphinpod id>/`. Do not `execute` `./dolphinpod-worker stop`.
 
 ## Notes
 - A crash-loop DURING the ~24 GB model download is normal; judge only after it finishes (often 20–40 min).
